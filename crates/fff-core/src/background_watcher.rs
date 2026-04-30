@@ -48,6 +48,7 @@ const AI_MODE_COOLDOWN_SECS: u64 = 5 * 60;
 impl BackgroundWatcher {
     pub fn new(
         base_path: PathBuf,
+        scan_paths: Vec<PathBuf>,
         git_workdir: Option<PathBuf>,
         shared_picker: SharedPicker,
         shared_frecency: SharedFrecency,
@@ -55,8 +56,9 @@ impl BackgroundWatcher {
         watch_dirs: Vec<PathBuf>,
     ) -> Result<Self, Error> {
         info!(
-            "Initializing background watcher for path: {}, mode: {:?}",
+            "Initializing background watcher for path: {}, scan_paths={}, mode: {:?}",
             base_path.display(),
+            scan_paths.len(),
             mode,
         );
 
@@ -69,6 +71,7 @@ impl BackgroundWatcher {
 
         let debouncer = Self::create_debouncer(
             base_path,
+            scan_paths,
             git_workdir,
             shared_picker,
             shared_frecency,
@@ -130,6 +133,7 @@ impl BackgroundWatcher {
 
     fn create_debouncer(
         base_path: PathBuf,
+        scan_paths: Vec<PathBuf>,
         git_workdir: Option<PathBuf>,
         shared_picker: SharedPicker,
         shared_frecency: SharedFrecency,
@@ -212,16 +216,21 @@ impl BackgroundWatcher {
         // the parent and dynamically added by the owner thread via watch_tx.
 
         if use_recursive {
-            debouncer.watch(base_path.as_path(), RecursiveMode::Recursive)?;
+            for scan_path in &scan_paths {
+                debouncer.watch(scan_path.as_path(), RecursiveMode::Recursive)?;
+            }
             info!(
-                "File watcher initialized with single recursive watch on {} \
+                "File watcher initialized with {} recursive watches under {} \
                  ({} directories exceeded threshold of {})",
+                scan_paths.len(),
                 base_path.display(),
                 watch_dirs.len(),
                 MAX_MACOS_NONRECURSIVE_WATCHES,
             );
         } else {
-            debouncer.watch(base_path.as_path(), RecursiveMode::NonRecursive)?;
+            for scan_path in &scan_paths {
+                debouncer.watch(scan_path.as_path(), RecursiveMode::NonRecursive)?;
+            }
 
             for dir in &watch_dirs {
                 match debouncer.watch(dir.as_path(), RecursiveMode::NonRecursive) {

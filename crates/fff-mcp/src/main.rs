@@ -20,6 +20,7 @@ use git2::Repository;
 use mimalloc::MiMalloc;
 use rmcp::{ServiceExt, transport::stdio};
 use server::FffServer;
+use std::path::PathBuf;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -104,9 +105,9 @@ pub const MCP_INSTRUCTIONS: &str = concat!(
 #[derive(Parser)]
 #[command(name = "fff-mcp", version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("FFF_GIT_HASH"), ")"))]
 pub(crate) struct Args {
-    /// Base directory to index. Defaults to the current working directory.
-    #[arg(value_name = "PATH")]
-    base_path: Option<String>,
+    /// Base directories to index. Defaults to the current working directory.
+    #[arg(value_name = "PATH", num_args = 0..)]
+    base_paths: Vec<String>,
 
     /// Path to the frecency database.
     #[arg(long = "frecency-db")]
@@ -191,6 +192,98 @@ fn dirs_home() -> String {
         .unwrap_or_else(|_| "/tmp".to_string())
 }
 
+fn resolve_single_base_path(path: PathBuf) -> String {
+    match Repository::discover(&path) {
+        Ok(repo) => {
+            if let Some(workdir) = repo.workdir() {
+                let git_root = workdir.to_string_lossy().to_string();
+                tracing::info!("Discovered git root: {}", git_root);
+                git_root
+            } else {
+                let base_path = path.to_string_lossy().to_string();
+                tracing::info!("Git repository is bare, using base path: {}", base_path);
+                base_path
+            }
+        }
+        Err(_) => {
+            let base_path = path.to_string_lossy().to_string();
+            tracing::info!(
+                "No git repository found, indexing from base path: {}",
+                base_path
+            );
+            base_path
+        }
+    }
+}
+
+fn common_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
+    let first = paths.first()?;
+    let mut components: Vec<_> = first.components().collect();
+
+    for path in &paths[1..] {
+        let path_components: Vec<_> = path.components().collect();
+        let shared_len = components
+            .iter()
+            .zip(path_components.iter())
+            .take_while(|(left, right)| left == right)
+            .count();
+        components.truncate(shared_len);
+    }
+
+    let mut ancestor = PathBuf::new();
+    for component in components {
+        ancestor.push(component.as_os_str());
+    }
+    Some(ancestor)
+}
+
+pub(crate) fn resolve_index_paths(
+    args: &Args,
+) -> Result<(String, Vec<String>), Box<dyn std::error::Error>> {
+    let paths = if args.base_paths.is_empty() {
+        vec![std::env::current_dir()?]
+    } else {
+        args.base_paths.iter().map(PathBuf::from).collect()
+    };
+
+    if paths.len() == 1 {
+        return Ok((
+            resolve_single_base_path(paths.into_iter().next().unwrap()),
+            Vec::new(),
+        ));
+    }
+
+    let mut scan_paths = Vec::with_capacity(paths.len());
+    for path in paths {
+        let canonical = std::fs::canonicalize(&path)?;
+        if !canonical.exists() {
+            return Err(format!("Scan path does not exist: {}", path.display()).into());
+        }
+        scan_paths.push(canonical);
+    }
+
+    scan_paths.sort();
+    scan_paths.dedup();
+
+    let base_path = common_ancestor(&scan_paths)
+        .filter(|path| path.parent().is_some())
+        .ok_or("Multiple scan paths do not share a non-root common ancestor")?;
+
+    tracing::info!(
+        "Indexing {} scan roots under common base path: {}",
+        scan_paths.len(),
+        base_path.display()
+    );
+
+    Ok((
+        base_path.to_string_lossy().to_string(),
+        scan_paths
+            .into_iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect(),
+    ))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = Args::parse();
@@ -205,32 +298,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Warning: Failed to init tracing: {}", e);
     }
 
-    let base_path = args.base_path.unwrap_or_else(|| {
-        std::env::current_dir()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string()
-    });
-
-    let base_path = match Repository::discover(&base_path) {
-        Ok(repo) => {
-            if let Some(workdir) = repo.workdir() {
-                let git_root = workdir.to_string_lossy().to_string();
-                tracing::info!("Discovered git root: {}", git_root);
-                git_root
-            } else {
-                tracing::info!("Git repository is bare, using base path: {}", base_path);
-                base_path
-            }
-        }
-        Err(_) => {
-            tracing::info!(
-                "No git repository found, indexing from base path: {}",
-                base_path
-            );
-            base_path
-        }
-    };
+    let (base_path, scan_paths) = resolve_index_paths(&args)?;
 
     let shared_picker = SharedPicker::default();
     let shared_frecency = SharedFrecency::default();
@@ -263,6 +331,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shared_frecency.clone(),
         fff::FilePickerOptions {
             base_path,
+            scan_paths,
             enable_mmap_cache: !args.no_warmup,
             enable_content_indexing,
             watch: !args.no_watch,

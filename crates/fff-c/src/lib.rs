@@ -259,6 +259,7 @@ pub unsafe extern "C" fn fff_create_instance2(
         shared_frecency.clone(),
         fff::FilePickerOptions {
             base_path: base_path_str,
+            scan_paths: Vec::new(),
             enable_mmap_cache,
             enable_content_indexing,
             watch,
@@ -921,6 +922,7 @@ pub unsafe extern "C" fn fff_restart_index(
         inst.frecency.clone(),
         fff::FilePickerOptions {
             base_path: canonical_path.to_string_lossy().to_string(),
+            scan_paths: Vec::new(),
             enable_mmap_cache: warmup_caches,
             enable_content_indexing: content_indexing,
             watch,

@@ -1,4 +1,4 @@
-use crate::Args;
+use crate::{Args, resolve_index_paths};
 use git2::Repository;
 
 fn check(label: &str, ok: bool, detail: &str) -> bool {
@@ -18,12 +18,7 @@ pub fn run_healthcheck(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut all_ok = true;
 
     // 1. Base path
-    let base_path = args.base_path.clone().unwrap_or_else(|| {
-        std::env::current_dir()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string()
-    });
+    let (base_path, scan_paths) = resolve_index_paths(args)?;
 
     let path_exists = std::path::Path::new(&base_path).is_dir();
     all_ok &= check(
@@ -35,6 +30,9 @@ pub fn run_healthcheck(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             "directory does not exist"
         },
     );
+    if !scan_paths.is_empty() {
+        all_ok &= check("Scan roots", true, &scan_paths.join(", "));
+    }
 
     // 2. Git repository
     match Repository::discover(&base_path) {

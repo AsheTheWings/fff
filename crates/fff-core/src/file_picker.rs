@@ -396,6 +396,7 @@ impl FileItem {
 /// Options for creating a [`FilePicker`].
 pub struct FilePickerOptions {
     pub base_path: String,
+    pub scan_paths: Vec<String>,
     /// Pre-populate mmap caches for top-frecency files after the initial scan.
     pub enable_mmap_cache: bool,
     /// Build content index after the initial scan for faster content-aware filtering.
@@ -413,6 +414,7 @@ impl Default for FilePickerOptions {
     fn default() -> Self {
         Self {
             base_path: ".".into(),
+            scan_paths: Vec::new(),
             enable_mmap_cache: false,
             enable_content_indexing: false,
             mode: FFFMode::default(),
@@ -425,6 +427,7 @@ impl Default for FilePickerOptions {
 pub struct FilePicker {
     pub mode: FFFMode,
     pub base_path: PathBuf,
+    scan_paths: Vec<PathBuf>,
     pub is_scanning: Arc<AtomicBool>,
     sync_data: FileSync,
     cache_budget: Arc<ContentCacheBudget>,
@@ -637,6 +640,24 @@ impl FilePicker {
             error!("Refusing to index filesystem root: {}", path.display());
             return Err(Error::FilesystemRoot(path));
         }
+        let scan_paths = if options.scan_paths.is_empty() {
+            vec![path.clone()]
+        } else {
+            let mut paths = Vec::with_capacity(options.scan_paths.len());
+            for scan_path in options.scan_paths {
+                let scan_path = PathBuf::from(scan_path);
+                if !scan_path.exists() {
+                    error!("Scan path does not exist: {}", scan_path.display());
+                    return Err(Error::InvalidPath(scan_path));
+                }
+                if scan_path.parent().is_none() {
+                    error!("Refusing to scan filesystem root: {}", scan_path.display());
+                    return Err(Error::FilesystemRoot(scan_path));
+                }
+                paths.push(scan_path);
+            }
+            paths
+        };
 
         let has_explicit_budget = options.cache_budget.is_some();
         let initial_budget = options.cache_budget.unwrap_or_default();
@@ -644,6 +665,7 @@ impl FilePicker {
         Ok(FilePicker {
             background_watcher: None,
             base_path: path,
+            scan_paths,
             cache_budget: Arc::new(initial_budget),
             cancelled: Arc::new(AtomicBool::new(false)),
             has_explicit_cache_budget: has_explicit_budget,
@@ -689,6 +711,7 @@ impl FilePicker {
         let cancelled = Arc::clone(&picker.cancelled);
         let post_scan_busy = Arc::clone(&picker.post_scan_busy);
         let path = picker.base_path.clone();
+        let scan_paths = picker.scan_paths.clone();
 
         {
             let mut guard = shared_picker.write()?;
@@ -697,6 +720,7 @@ impl FilePicker {
 
         spawn_scan_and_watcher(
             path,
+            scan_paths,
             scan_signal,
             watcher_ready,
             synced_files_count,
@@ -728,6 +752,7 @@ impl FilePicker {
         let empty_frecency = SharedFrecency::default();
         let walk = walk_filesystem(
             &self.base_path,
+            &self.scan_paths,
             &self.scanned_files_count,
             &empty_frecency,
             self.mode,
@@ -771,6 +796,7 @@ impl FilePicker {
         let watch_dirs = self.extract_watch_dirs();
         let watcher = BackgroundWatcher::new(
             self.base_path.clone(),
+            self.scan_paths.clone(),
             git_workdir,
             shared_picker.clone(),
             shared_frecency.clone(),
@@ -1560,6 +1586,7 @@ impl FilePicker {
 
         let walk_result = walk_filesystem(
             &self.base_path,
+            &self.scan_paths,
             &self.scanned_files_count,
             shared_frecency,
             self.mode,
@@ -1652,6 +1679,7 @@ pub struct ScanProgress {
 #[allow(clippy::too_many_arguments)]
 fn spawn_scan_and_watcher(
     base_path: PathBuf,
+    scan_paths: Vec<PathBuf>,
     scan_signal: Arc<AtomicBool>,
     watcher_ready: Arc<AtomicBool>,
     synced_files_count: Arc<AtomicUsize>,
@@ -1671,7 +1699,13 @@ fn spawn_scan_and_watcher(
 
         let git_workdir;
 
-        match walk_filesystem(&base_path, &synced_files_count, &shared_frecency, mode) {
+        match walk_filesystem(
+            &base_path,
+            &scan_paths,
+            &synced_files_count,
+            &shared_frecency,
+            mode,
+        ) {
             Ok(walk) => {
                 if cancelled.load(Ordering::Acquire) {
                     info!("Walk completed but picker was replaced, discarding results");
@@ -1730,6 +1764,7 @@ fn spawn_scan_and_watcher(
 
             match BackgroundWatcher::new(
                 base_path.clone(),
+                scan_paths.clone(),
                 git_workdir,
                 shared_picker.clone(),
                 shared_frecency.clone(),
@@ -2041,6 +2076,7 @@ struct WalkResult {
 /// take 10+ seconds on very large repos (e.g. chromium).
 fn walk_filesystem(
     base_path: &Path,
+    scan_paths: &[PathBuf],
     synced_files_count: &Arc<AtomicUsize>,
     shared_frecency: &SharedFrecency,
     mode: FFFMode,
@@ -2076,7 +2112,10 @@ fn walk_filesystem(
     // Walk files (the fast part, typically 2-3s even on huge repos).
     let is_git_repo = git_workdir.is_some();
     let bg_threads = BACKGROUND_THREAD_POOL.current_num_threads();
-    let mut walk_builder = WalkBuilder::new(base_path);
+    let mut walk_builder = WalkBuilder::new(&scan_paths[0]);
+    for scan_path in &scan_paths[1..] {
+        walk_builder.add(scan_path);
+    }
     walk_builder
         // this is a very important guard for the user opening ~/ or other root non-git dir
         .hidden(!is_git_repo)
